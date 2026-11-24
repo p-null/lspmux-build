@@ -1,0 +1,83 @@
+name: release
+
+# Builds upstream lspmux (https://codeberg.org/p2502/lspmux) at a pinned, verified commit for
+# Linux aarch64 and x86_64, and publishes the binaries as a GitHub release of this repo.
+# Upstream publishes no prebuilt Linux aarch64 binary. To build a new version, change VERSION
+# and COMMIT below and push; a version whose release already exists is skipped.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: https://codeberg.org/p2502/lspmux.git
+  VERSION: "0.3.0"
+  COMMIT: 571a133555873776ee8863209d83acf8246eff99
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - id: check
+        run: |
+          draft=$(gh release view "v$VERSION" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
+          if [ "$draft" = "false" ]; then
+            echo "release v$VERSION is published; nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            # a draft left by a failed run is rebuilt from scratch
+            [ "$draft" = "true" ] && gh release delete "v$VERSION" --yes
+            gh release create "v$VERSION" --target "$GITHUB_SHA" --draft \
+              --title "lspmux $VERSION" \
+              --notes "Upstream lspmux $VERSION, built from https://codeberg.org/p2502/lspmux commit $COMMIT (tag v$VERSION) with \`--locked\`. Licensed EUPL-1.2 by its authors; the licence and upstream README are inside each archive, and the source is at the commit above."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: release
+    if: needs.release.outputs.build == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Fetch upstream at the pinned commit
+        run: |
+          git init -q src
+          git -C src fetch -q --depth 1 "$UPSTREAM" "refs/tags/v$VERSION"
+          got=$(git -C src rev-parse 'FETCH_HEAD^{commit}')
+          test "$got" = "$COMMIT" || { echo "tag v$VERSION is $got, expected $COMMIT"; exit 1; }
+          git -C src checkout -q --detach FETCH_HEAD
+      - name: Build
+        working-directory: src
+        run: |
+          rustc --version
+          cargo build --release --locked
+      - name: Package and upload
+        run: |
+          name="lspmux-$VERSION-${{ matrix.target }}"
+          mkdir "$name"
+          cp src/target/release/lspmux src/LICENSE src/README.md "$name/"
+          "$name/lspmux" --version
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          gh release upload "v$VERSION" "$name.tar.gz" "$name.tar.gz.sha256"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - run: gh release edit "v$VERSION" --draft=false --latest
